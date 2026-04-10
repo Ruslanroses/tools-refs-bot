@@ -1,0 +1,43 @@
+name: Daily Tools Refs
+
+on:
+  schedule:
+    - cron: '0 9 * * *'  # 12:00 Tbilisi (UTC+3)
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Restore seen_ids
+        uses: actions/cache@v4
+        with:
+          path: seen_278506234.json
+          key: seen-278506234-${{ github.run_id }}
+          restore-keys: seen-278506234-
+
+      - name: Run bot
+        env:
+          ARENA_TOKEN: ${{ secrets.ARENA_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          SUBSCRIBERS: ${{ secrets.SUBSCRIBERS }}
+          DAILY_MIN: 20
+          DAILY_MAX: 40
+        run: python arena_refs_bot.py
+
+      - name: Save seen_ids
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: seen_278506234.json
+          key: seen-278506234-${{ github.run_id }}
