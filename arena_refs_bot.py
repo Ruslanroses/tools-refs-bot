@@ -92,8 +92,8 @@ def _parse_subscribers() -> list[dict]:
     slug = os.environ.get("SOURCE_CHANNEL_SLUG", "interface-m0ymi5bf4dw")
     return [{"chat_id": cid.strip(), "slugs": [slug], "slug": slug} for cid in chat_ids_raw.split(",") if cid.strip()]
 
-SUBSCRIBERS = _parse_subscribers()
-TELEGRAM_CHAT_ID = SUBSCRIBERS[0]["chat_id"] if SUBSCRIBERS else ""
+SUBSCRIBERS: list = []
+TELEGRAM_CHAT_ID: str = ""
 
 # исходный канал (fallback для обратной совместимости)
 SOURCE_CHANNEL_SLUG  = os.environ.get("SOURCE_CHANNEL_SLUG", "interface-m0ymi5bf4dw")
@@ -488,38 +488,6 @@ def block_caption(block: dict) -> str:
     return "  ·  ".join(parts)
 
 
-def send_daily_digest(blocks: list[dict]) -> None:
-    today = date.today().strftime("%d.%m.%Y")
-    log.info("Рассылаю %d блоков для %d подписчиков…", len(blocks), len(TELEGRAM_CHAT_IDS))
-
-    for chat_id in TELEGRAM_CHAT_IDS:
-        header = (
-            f"🗂 <b>Референсы на {today}</b>\n"
-            f"Нашёл {len(blocks)} новых блоков на основе доски."
-        )
-        tg_send_message(header, chat_id=chat_id)
-        time.sleep(0.5)
-
-        sent = 0
-        for block in blocks:
-            img_url   = block_image_url(block)
-            caption   = block_caption(block)
-            arena_url = f"https://www.are.na/block/{block['id']}"
-
-            ok = False
-            if img_url:
-                ok = tg_send_photo(img_url, caption, chat_id=chat_id)
-            if not ok:
-                text = caption + f"\n{arena_url}"
-                ok = tg_send_message(text, chat_id=chat_id)
-
-            if ok:
-                sent += 1
-            time.sleep(0.4)
-
-        log.info("  chat_id %s — отправлено %d блоков", chat_id, sent)
-
-
 # ── seen ids ──────────────────────────────────────────────────────────────────
 
 def load_seen_ids() -> set[int]:
@@ -618,6 +586,9 @@ def run_for_subscriber(sub: dict, all_seen_ids: set[int]) -> set[int]:
 
 
 def run():
+    global SUBSCRIBERS, TELEGRAM_CHAT_ID
+    SUBSCRIBERS = _parse_subscribers()
+    TELEGRAM_CHAT_ID = SUBSCRIBERS[0]["chat_id"] if SUBSCRIBERS else ""
     log.info("═══ Are.na Daily Refs Bot ═══")
     log.info("Подписчиков: %d", len(SUBSCRIBERS))
 
