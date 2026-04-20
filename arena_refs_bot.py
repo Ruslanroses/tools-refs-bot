@@ -19,7 +19,7 @@ import time
 import random
 import logging
 import httpx
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -121,6 +121,9 @@ DAILY_MAX = int(os.environ.get("DAILY_MAX", 40))
 # файл для хранения уже виденных block id
 SEEN_IDS_FILE = Path(os.environ.get("SEEN_IDS_FILE", "seen_ids.json"))
 
+CHANNELS_CACHE_FILE = Path(os.environ.get("CHANNELS_CACHE_FILE", "channels_cache.json"))
+CHANNELS_CACHE_TTL_DAYS = 3
+
 ARENA_BASE  = "https://api.are.na/v2"
 TG_BASE     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 PER_PAGE    = 100   # максимум для Are.na API
@@ -202,6 +205,61 @@ def get_block_channels(block_id: int, max_pages: int = 3) -> list[dict]:
     return channels
 
 
+def load_channels_cache() -> dict:
+    """Загружает channels_cache.json или возвращает пустой cache."""
+    if not CHANNELS_CACHE_FILE.exists():
+        return {"channels": {}}
+    try:
+        data = json.loads(CHANNELS_CACHE_FILE.read_text())
+        if "channels" not in data:
+            data["channels"] = {}
+        log.info("channels_cache: %d каналов в кэше", len(data["channels"]))
+        return data
+    except Exception as e:
+        log.warning("channels_cache: не удалось прочитать (%s), старт с пустого", e)
+        return {"channels": {}}
+
+
+def save_channels_cache(cache: dict) -> None:
+    """Атомарная запись через tmp + rename."""
+    cache["updated"] = datetime.utcnow().isoformat() + "Z"
+    tmp = CHANNELS_CACHE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache))
+    tmp.rename(CHANNELS_CACHE_FILE)
+    log.info("channels_cache сохранён: %d каналов", len(cache.get("channels", {})))
+
+
+def get_channel_block_ids_cached(channel_id: int, cache: dict) -> set[int]:
+    """Возвращает block_ids канала с кэшем (3-дневный TTL).
+
+    Cache hit → возврат из файла без API вызова.
+    Cache miss или expired → вызов get_channel_block_ids + сохранение в cache.
+    """
+    key = str(channel_id)
+    entry = cache.get("channels", {}).get(key)
+    if entry:
+        # Проверка TTL внутри файла (доп. защита сверху GHA cache)
+        try:
+            fetched = datetime.fromisoformat(entry["fetched_at"].rstrip("Z"))
+            age_days = (datetime.utcnow() - fetched).total_seconds() / 86400
+            if age_days < CHANNELS_CACHE_TTL_DAYS:
+                log.info("Cache HIT: channel_id=%d (%d block_ids, age=%.1fd)",
+                         channel_id, len(entry["block_ids"]), age_days)
+                return set(entry["block_ids"])
+            log.info("Cache EXPIRED: channel_id=%d (age=%.1fd)", channel_id, age_days)
+        except Exception:
+            pass  # bad timestamp — считаем miss
+    # Cache MISS
+    log.info("Cache MISS: channel_id=%d, фетчу из API", channel_id)
+    ids = get_channel_block_ids(channel_id)
+    cache.setdefault("channels", {})[key] = {
+        "block_ids": sorted(ids),
+        "fetched_at": datetime.utcnow().isoformat() + "Z",
+    }
+    save_channels_cache(cache)
+    return ids
+
+
 def get_channel_block_ids(channel_id: int) -> set[int]:
     """Быстро берём только id блоков из канала (первые 3 страницы)."""
     ids = set()
@@ -267,6 +325,8 @@ def discover_new_blocks(
       source_blocks → смежные каналы → блоки из этих каналов
     Возвращает отсортированный по score список новых блоков.
     """
+    channels_cache = load_channels_cache()
+
     source_ids = {b["id"] for b in source_blocks}
     all_known  = source_ids | known_ids
 
@@ -305,7 +365,7 @@ def discover_new_blocks(
                 if source_slugs and ch_slug in source_slugs:
                     continue
 
-                ch_block_ids = get_channel_block_ids(ch_id)
+                ch_block_ids = get_channel_block_ids_cached(ch_id, channels_cache)
                 for new_id in ch_block_ids:
                     if new_id in all_known:
                         continue
@@ -383,6 +443,7 @@ def discover_new_blocks(
 
     # применяем умный фильтр
     result = smart_filter(result, candidates, target_count)
+    save_channels_cache(channels_cache)
     return result
 
 
@@ -400,11 +461,14 @@ def smart_filter(blocks: list[dict], candidates: dict, target_count: int) -> lis
     seen_domains: set[str] = set()
 
     for block in blocks:
-        bid   = block.get("id")
-        score = candidates.get(bid, {}).get("score", 0)
+        bid     = block.get("id")
+        score   = candidates.get(bid, {}).get("score", 0)
+        channel = candidates.get(bid, {}).get("channel", "?")
+        sources = candidates.get(bid, {}).get("sources", set())
 
         # Фильтр по минимальному score — берём только хорошо связанные
         if score < 2 and len(blocks) > target_count:
+            log.debug("  SKIP block=%s score=%d channel=%s (low score)", bid, score, channel)
             continue
 
         img = block.get("image") or {}
@@ -426,9 +490,16 @@ def smart_filter(blocks: list[dict], candidates: dict, target_count: int) -> lis
                 pass
 
         if domain and domain in seen_domains:
+            log.debug("  SKIP block=%s domain=%s (duplicate domain)", bid, domain)
             continue
         if domain:
             seen_domains.add(domain)
+
+        block_type = "image" if has_image else ("link" if src_url else "other")
+        log.debug(
+            "  OK   block=%s type=%-5s score=%d channel=%s sources=%s",
+            bid, block_type, score, channel, "+".join(sorted(sources)),
+        )
 
         if has_image:
             images.append(block)
@@ -503,15 +574,61 @@ def block_caption(block: dict) -> str:
 
 # ── seen ids ──────────────────────────────────────────────────────────────────
 
-def load_seen_ids() -> set[int]:
-    if SEEN_IDS_FILE.exists():
-        data = json.loads(SEEN_IDS_FILE.read_text())
+def load_seen_ids(chat_id: str) -> set[int]:
+    """Загружает seen_ids для подписчика с поддержкой 30-дневного rolling window.
+
+    Поддерживает два формата:
+    - flat list [int, ...] — старый формат, обратная совместимость (без фильтрации)
+    - {"v": 2, "ids": {"block_id": "YYYY-MM-DD", ...}} — новый формат с датами
+    """
+    seen_file = Path(f"seen_{chat_id}.json")
+    if not seen_file.exists():
+        return set()
+    data = json.loads(seen_file.read_text())
+
+    # Обратная совместимость: старый flat list формат
+    if isinstance(data, list):
+        log.info("seen_%s: старый формат (flat list), %d IDs — миграция произойдёт при сохранении", chat_id, len(data))
         return set(data)
-    return set()
+
+    # Новый v2 формат с датами — применяем 30-дневное окно
+    cutoff = (date.today() - timedelta(days=30)).isoformat()
+    valid = {int(bid) for bid, d in data.get("ids", {}).items() if d >= cutoff}
+    total = len(data.get("ids", {}))
+    log.info("seen_%s: %d IDs всего, %d в 30-дневном окне (cutoff=%s)", chat_id, total, len(valid), cutoff)
+    return valid
 
 
-def save_seen_ids(ids: set[int]) -> None:
-    SEEN_IDS_FILE.write_text(json.dumps(list(ids)))
+def save_seen_ids(chat_id: str, all_ids: set[int]) -> None:
+    """Сохраняет seen_ids в формате v2 с датами.
+
+    При первом сохранении мигрирует старый flat list: присваивает всем старым IDs
+    дату TODAY (per decision D-01 — плавный переход, блоки остаются исключёнными ещё 30 дней).
+    Новые IDs (не в existing_dates) также получают сегодняшнюю дату.
+    """
+    seen_file = Path(f"seen_{chat_id}.json")
+    today = date.today().isoformat()
+
+    # Читаем существующие даты из файла
+    existing_dates: dict[str, str] = {}
+    if seen_file.exists():
+        raw = json.loads(seen_file.read_text())
+        if isinstance(raw, dict):
+            # v2 формат — берём существующие даты
+            existing_dates = raw.get("ids", {})
+        else:
+            # Миграция flat list: присваиваем всем старым IDs дату TODAY
+            existing_dates = {str(bid): today for bid in raw}
+            log.info("seen_%s: мигрирую flat list (%d IDs) в v2 формат, дата=%s", chat_id, len(raw), today)
+
+    # Для каждого ID из all_ids: если нет в existing_dates — ставим сегодня
+    merged = {**existing_dates}
+    for bid in all_ids:
+        if str(bid) not in merged:
+            merged[str(bid)] = today
+
+    seen_file.write_text(json.dumps({"v": 2, "ids": merged}))
+    log.info("seen_%s сохранён: %d IDs (формат v2)", chat_id, len(merged))
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -541,8 +658,7 @@ def run_for_subscriber(sub: dict, all_seen_ids: set[int]) -> set[int]:
     source_slugs = set(slugs)
 
     # seen_ids персональные для каждого подписчика
-    seen_file = Path(f"seen_{chat_id}.json")
-    seen_ids  = set(json.loads(seen_file.read_text())) if seen_file.exists() else set()
+    seen_ids = load_seen_ids(chat_id)
 
     # исключаем блоки из досок других подписчиков чтобы не повторяться
     other_slugs = []
@@ -597,7 +713,7 @@ def run_for_subscriber(sub: dict, all_seen_ids: set[int]) -> set[int]:
 
     # обновляем персональные seen_ids
     new_ids = {b["id"] for b in new_blocks}
-    seen_file.write_text(json.dumps(list(seen_ids | new_ids)))
+    save_seen_ids(chat_id, seen_ids | new_ids)
     return new_ids
 
 
