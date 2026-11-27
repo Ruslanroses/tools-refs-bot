@@ -1,8 +1,12 @@
 """
-Are.na Daily References Bot
-----------------------------
-Каждый день находит 20-40 новых визуальных референсов на основе
-твоей Are.na доски и отправляет их в Telegram + сохраняет на Are.na.
+Are.na References Bot
+---------------------
+Раз в неделю находит новые визуальные референсы на основе Are.na досок
+и отправляет их подписчикам в Telegram.
+
+Поиск идёт один раз на каждый набор досок, а не на каждого подписчика:
+у подписчиков из Gist доски одинаковые, и раньше один и тот же обход
+повторялся по разу на человека (сотни повторных загрузок, обрыв по 6 ч).
 
 Логика поиска (граф связей Are.na):
   1. Берёт все блоки из твоего исходного канала.
@@ -129,6 +133,12 @@ TG_BASE     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 PER_PAGE    = 100   # максимум для Are.na API
 RATE_SLEEP  = 0.3   # секунды между запросами (rate limit)
 
+# DRY_RUN=1: всё ищет, но ничего не отправляет в Telegram и не пишет seen-файлы.
+DRY_RUN = os.environ.get("DRY_RUN", "").strip() not in ("", "0", "false")
+
+# Счётчик запросов к Are.na за запуск (для итоговой строки в логе).
+ARENA_STATS = {"requests": 0, "refused": 0}
+
 # ── Are.na API ────────────────────────────────────────────────────────────────
 
 def arena_headers() -> dict:
@@ -140,7 +150,14 @@ def arena_get(path: str, params: dict = None, retries: int = 8) -> dict:
     url = f"{ARENA_BASE}{path}"
     for attempt in range(retries):
         try:
+            ARENA_STATS["requests"] += 1
             r = httpx.get(url, headers=arena_headers(), params=params, timeout=30)
+            if r.status_code in (401, 403, 404, 410):
+                # Отказ, а не временный сбой: повтор не поможет, а раньше
+                # 8 повторов на каждый такой запрос растягивали запуск на часы.
+                ARENA_STATS["refused"] += 1
+                log.error("HTTP error %s for %s (без повторов)", r.status_code, url)
+                return {}
             if r.status_code == 429:
                 wait = 15 * (attempt + 1)
                 log.warning("Rate limit, жду %ss…", wait)
@@ -174,8 +191,19 @@ def arena_post(path: str, body: dict) -> dict:
     return r.json()
 
 
+_CHANNEL_BLOCKS_MEMO: dict[str, list[dict]] = {}
+
+
 def get_channel_blocks(slug: str) -> list[dict]:
-    """Возвращает все блоки канала (постранично)."""
+    """Возвращает все блоки канала (постранично). Каждая доска грузится один раз за запуск."""
+    if slug in _CHANNEL_BLOCKS_MEMO:
+        return _CHANNEL_BLOCKS_MEMO[slug]
+    blocks = _fetch_channel_blocks(slug)
+    _CHANNEL_BLOCKS_MEMO[slug] = blocks
+    return blocks
+
+
+def _fetch_channel_blocks(slug: str) -> list[dict]:
     log.info("Загружаю канал '%s'…", slug)
     first  = arena_get(f"/channels/{slug}")
     length = first.get("length", 0)
@@ -519,26 +547,46 @@ def smart_filter(blocks: list[dict], candidates: dict, target_count: int) -> lis
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 
+# Последний отказ Telegram: (код, описание). Нужен, чтобы понять, почему
+# подписчику не дошло: не открывал бота, заблокировал, удалил аккаунт.
+TG_LAST_ERROR: dict = {"code": 0, "description": ""}
+
+
+def _tg_post(method: str, payload: dict) -> bool:
+    if DRY_RUN:
+        log.info("DRY_RUN: %s → %s", method, payload.get("chat_id"))
+        return True
+    try:
+        r = httpx.post(f"{TG_BASE}/{method}", json=payload, timeout=15)
+    except httpx.HTTPError as e:
+        TG_LAST_ERROR.update(code=0, description=str(e))
+        return False
+    if r.status_code == 200:
+        return True
+    try:
+        desc = r.json().get("description", "")
+    except Exception:
+        desc = r.text[:200]
+    TG_LAST_ERROR.update(code=r.status_code, description=desc)
+    return False
+
+
 def tg_send_message(text: str, parse_mode: str = "HTML", chat_id: str = "") -> bool:
-    cid = chat_id or TELEGRAM_CHAT_ID
-    r = httpx.post(f"{TG_BASE}/sendMessage", json={
-        "chat_id":    cid,
+    return _tg_post("sendMessage", {
+        "chat_id":    chat_id or TELEGRAM_CHAT_ID,
         "text":       text,
         "parse_mode": parse_mode,
         "disable_web_page_preview": False,
-    }, timeout=15)
-    return r.status_code == 200
+    })
 
 
 def tg_send_photo(url: str, caption: str, chat_id: str = "") -> bool:
-    cid = chat_id or TELEGRAM_CHAT_ID
-    r = httpx.post(f"{TG_BASE}/sendPhoto", json={
-        "chat_id": cid,
+    return _tg_post("sendPhoto", {
+        "chat_id": chat_id or TELEGRAM_CHAT_ID,
         "photo":   url,
         "caption": caption,
         "parse_mode": "HTML",
-    }, timeout=15)
-    return r.status_code == 200
+    })
 
 
 def block_image_url(block: dict) -> Optional[str]:
@@ -633,69 +681,38 @@ def save_seen_ids(chat_id: str, all_ids: set[int]) -> None:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-def run_for_subscriber(sub: dict, all_seen_ids: set[int]) -> set[int]:
-    """Запускает подборку для одного подписчика."""
-    chat_id = sub["chat_id"]
-    slugs   = sub.get("slugs") or [sub.get("slug", "")]
-
-    log.info("── Подписчик %s (доски: %s) ──", chat_id, ", ".join(slugs))
-
-    blocks_per_slug: dict[str, list[dict]] = {}
-    source_blocks = []
-    for slug in slugs:
-        blocks = get_channel_blocks(slug)
-        if blocks:
-            blocks_per_slug[slug] = blocks
-            source_blocks.extend(blocks)
-            log.info("Загружено %d блоков из '%s'", len(blocks), slug)
-        else:
-            log.warning("Доска '%s' пуста или недоступна", slug)
-
-    if not source_blocks:
-        tg_send_message("😶 Не удалось загрузить доску. Попробую завтра!", chat_id=chat_id)
-        return set()
-
-    source_slugs = set(slugs)
-
-    # seen_ids персональные для каждого подписчика
-    seen_ids = load_seen_ids(chat_id)
-
-    # исключаем блоки из досок других подписчиков чтобы не повторяться
-    other_slugs = []
-    for s in SUBSCRIBERS:
-        if s["chat_id"] != chat_id:
-            other_slugs.extend(s.get("slugs") or [s.get("slug", "")])
-    for other_slug in other_slugs:
-        try:
-            other_blocks = get_channel_blocks(other_slug)
-            other_ids = {b["id"] for b in other_blocks}
-            seen_ids = seen_ids | other_ids
-            log.info("Исключаю %d блоков из доски '%s'", len(other_ids), other_slug)
-        except Exception:
-            pass
-
+def _sub_count(sub: dict) -> int:
     sub_min = sub.get("daily_min", DAILY_MIN)
     sub_max = sub.get("daily_max", DAILY_MAX)
-    count = random.randint(sub_min, sub_max)
-    log.info("Цель для %s: %d блоков (min=%d, max=%d)", chat_id, count, sub_min, sub_max)
-    log.info("Блоков в доске: %d, уже видели/исключено: %d", len(source_blocks), len(seen_ids))
+    return random.randint(min(sub_min, sub_max), max(sub_min, sub_max))
 
-    new_blocks = discover_new_blocks(source_blocks, seen_ids, count, source_slugs=source_slugs, blocks_per_slug=blocks_per_slug)
-    new_blocks = [b for b in new_blocks if b.get("id")]
 
-    if not new_blocks:
-        tg_send_message("😶 Сегодня новых референсов не нашлось. Попробую завтра!", chat_id=chat_id)
-        log.info("Новых блоков нет для %s", chat_id)
-        return set()
+def _group_subscribers(subscribers: list[dict]) -> list[tuple[list[str], list[dict]]]:
+    """Группирует подписчиков по набору досок, сохраняя порядок первого появления."""
+    groups: dict[tuple, list[dict]] = {}
+    for sub in subscribers:
+        slugs = sub.get("slugs") or [sub.get("slug", "")]
+        key = tuple(s for s in slugs if s)
+        groups.setdefault(key, []).append(sub)
+    return [(list(k), v) for k, v in groups.items()]
 
-    # отправляем в Telegram
+
+def send_to_subscriber(chat_id: str, blocks: list[dict]) -> int:
+    """Отправляет подборку одному подписчику. Возвращает число доставленных блоков.
+
+    Если не дошёл даже заголовок, остальное не шлём: Telegram отказывает
+    этому человеку целиком (не открывал бота, заблокировал, удалил аккаунт).
+    """
     today = date.today().strftime("%d.%m.%Y")
-    header = f"🗂 <b>Референсы на {today}</b>\nНашёл {len(new_blocks)} новых блоков на основе твоей доски."
-    tg_send_message(header, chat_id=chat_id)
+    header = f"🗂 <b>Референсы на {today}</b>\nНашёл {len(blocks)} новых блоков на основе твоей доски."
+    if not tg_send_message(header, chat_id=chat_id):
+        log.warning("Недоступен %s: Telegram %s %s — подборку не шлю",
+                    chat_id, TG_LAST_ERROR["code"], TG_LAST_ERROR["description"])
+        return -1
     time.sleep(0.5)
 
     sent = 0
-    for block in new_blocks:
+    for block in blocks:
         img_url   = block_image_url(block)
         caption   = block_caption(block)
         arena_url = f"https://www.are.na/block/{block['id']}"
@@ -708,13 +725,68 @@ def run_for_subscriber(sub: dict, all_seen_ids: set[int]) -> set[int]:
         if ok:
             sent += 1
         time.sleep(0.4)
+    return sent
 
-    log.info("Отправлено %s: %d блоков", chat_id, sent)
 
-    # обновляем персональные seen_ids
-    new_ids = {b["id"] for b in new_blocks}
-    save_seen_ids(chat_id, seen_ids | new_ids)
-    return new_ids
+def run_for_group(slugs: list[str], subs: list[dict], other_slugs: list[str], report: dict) -> None:
+    """Один поиск на группу подписчиков с одинаковыми досками, потом рассылка каждому."""
+    log.info("══ Группа: %d подписчиков, доски: %s ══", len(subs), ", ".join(slugs))
+
+    blocks_per_slug: dict[str, list[dict]] = {}
+    source_blocks: list[dict] = []
+    for slug in slugs:
+        blocks = get_channel_blocks(slug)
+        if blocks:
+            blocks_per_slug[slug] = blocks
+            source_blocks.extend(blocks)
+            log.info("Загружено %d блоков из '%s'", len(blocks), slug)
+        else:
+            log.warning("Доска '%s' пуста или недоступна", slug)
+
+    if not source_blocks:
+        for sub in subs:
+            tg_send_message("😶 Не удалось загрузить доску. Попробую в следующий раз!", chat_id=sub["chat_id"])
+            report["board_failed"] += 1
+        return
+
+    # Блоки из досок других групп не предлагаем: они и так придут тем подписчикам.
+    exclude: set[int] = set()
+    for other_slug in other_slugs:
+        other_ids = {b["id"] for b in get_channel_blocks(other_slug)}
+        exclude |= other_ids
+
+    # Что уже видел хоть кто-то из группы, не предлагаем никому:
+    # так вся группа получает одну и ту же свежую подборку.
+    seen_by_sub = {sub["chat_id"]: load_seen_ids(sub["chat_id"]) for sub in subs}
+    union_seen: set[int] = set().union(*seen_by_sub.values()) if seen_by_sub else set()
+    counts = {sub["chat_id"]: _sub_count(sub) for sub in subs}
+    pool_size = max(counts.values())
+
+    log.info("Цель группы: %d блоков; исключено: доски других групп %d, уже видели %d",
+             pool_size, len(exclude), len(union_seen))
+
+    pool = discover_new_blocks(
+        source_blocks, exclude | union_seen, pool_size,
+        source_slugs=set(slugs), blocks_per_slug=blocks_per_slug,
+    )
+    pool = [b for b in pool if b.get("id")]
+    log.info("Подборка группы: %d блоков", len(pool))
+
+    for sub in subs:
+        chat_id = sub["chat_id"]
+        own = [b for b in pool if b["id"] not in seen_by_sub[chat_id]][:counts[chat_id]]
+        if not own:
+            tg_send_message("😶 Новых референсов в этот раз не нашлось. Попробую в следующий раз!", chat_id=chat_id)
+            report["nothing_new"] += 1
+            continue
+        sent = send_to_subscriber(chat_id, own)
+        if sent < 0:
+            report["unreachable"] += 1
+            continue
+        log.info("Отправлено %s: %d блоков", chat_id, sent)
+        report["delivered"] += 1
+        if not DRY_RUN:
+            save_seen_ids(chat_id, seen_by_sub[chat_id] | {b["id"] for b in own})
 
 
 def run():
@@ -722,6 +794,7 @@ def run():
     SUBSCRIBERS = _parse_subscribers()
 
     target_chat_id = os.environ.get("TARGET_CHAT_ID", "").strip()
+    all_subscribers = list(SUBSCRIBERS)
     if target_chat_id:
         matching = [s for s in SUBSCRIBERS if s["chat_id"] == target_chat_id]
         if not matching:
@@ -731,16 +804,27 @@ def run():
         log.info("Режим /more: только для chat_id=%s", target_chat_id)
 
     TELEGRAM_CHAT_ID = SUBSCRIBERS[0]["chat_id"] if SUBSCRIBERS else ""
-    log.info("═══ Are.na Daily Refs Bot ═══")
+    log.info("═══ Are.na Refs Bot%s ═══", " (DRY_RUN, без отправки)" if DRY_RUN else "")
     log.info("Подписчиков: %d", len(SUBSCRIBERS))
 
-    for sub in SUBSCRIBERS:
-        try:
-            run_for_subscriber(sub, set())
-        except Exception as e:
-            log.error("Ошибка для подписчика %s: %s", sub.get("chat_id"), e)
+    # Исключения считаем по всем подписчикам, даже в режиме /more,
+    # чтобы подборка одного человека не зависела от режима запуска.
+    all_groups = _group_subscribers(all_subscribers)
+    groups = _group_subscribers(SUBSCRIBERS)
+    log.info("Групп с разными досками: %d", len(groups))
 
-    log.info("═══ Готово! ═══")
+    report = {"delivered": 0, "unreachable": 0, "nothing_new": 0, "board_failed": 0}
+    for slugs, subs in groups:
+        other_slugs = sorted({s for g_slugs, _ in all_groups if g_slugs != slugs for s in g_slugs} - set(slugs))
+        try:
+            run_for_group(slugs, subs, other_slugs, report)
+        except Exception as e:
+            log.error("Ошибка для группы %s: %s", ", ".join(slugs), e)
+
+    log.info("═══ Готово: доставлено %d, недоступны %d, без новых %d, доска не загрузилась %d · "
+             "запросов к Are.na %d, отказов %d ═══",
+             report["delivered"], report["unreachable"], report["nothing_new"], report["board_failed"],
+             ARENA_STATS["requests"], ARENA_STATS["refused"])
 
 
 if __name__ == "__main__":

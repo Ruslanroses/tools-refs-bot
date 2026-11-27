@@ -2,7 +2,7 @@ name: Daily Tools Refs
 
 on:
   schedule:
-    - cron: '0 9 * * *'  # 12:00 Tbilisi (UTC+3)
+    - cron: '17 5 * * 1'  # раз в неделю: понедельник 05:17 UTC = 09:17 Тбилиси (GitHub часто запускает на несколько часов позже)
   workflow_dispatch:
     inputs:
       target_chat_id:
@@ -13,6 +13,7 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -48,8 +49,8 @@ jobs:
           ARENA_TOKEN: ${{ secrets.ARENA_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           SUBSCRIBERS: ${{ secrets.SUBSCRIBERS }}
-          DAILY_MIN: 15
-          DAILY_MAX: 15
+          DAILY_MIN: 30
+          DAILY_MAX: 30
           BOT_NAME: Arena_Tools
           DEFAULT_SLUGS: ${{ secrets.DEFAULT_SLUGS }}
           GIST_ID: ${{ secrets.GIST_ID }}
